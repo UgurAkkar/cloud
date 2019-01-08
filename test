@@ -1,0 +1,188 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ## VPC CDR BLOCK
+    vpc_cidr_block: 10.0.0.0/16
+    ## VPC subnets 2 subnet A en Subnet B
+    vpc_subnets:
+      public-a:
+        cidr: 10.0.1.0/24
+        az: "{{ item.region | default('us-east-1') }}"
+      public-b:
+        cidr: 10.0.4.0/24
+        az: "{{ item.region | default('us-east-1') }}"
+    ## Web interfaces
+    instances:
+      - name: a4d.lamp.www.1
+        group: "lamp-www"
+        security_group: ["default", "sg_ec2"]
+      - name: a4d.lamp.www.2
+        group: "lamp-www"
+        security_group: ["default", "sg_ec2"]
+    ## 2 security Groups voor Instances en Loadbalancers
+    security_groups:
+      - name: sg_ec2
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: -1
+            from_port: 0
+            to_port: 0
+            cidr_ip: 0.0.0.0/0
+
+      - name: sg_elb
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+        rules_egress: []
+  tasks:
+    - name: create VPC
+      ec2_vpc_net:
+        name: "student_vpc"
+        cidr_block: "{{ vpc_cidr_block }}"
+        region: "us-east-1"
+      register: create_vpc
+    
+    ## VPC ID zoeken
+    - name: "set fact: VPC ID"
+      set_fact:
+        vpc_id: "{{ create_vpc.vpc.id }}"
+    
+    ## Subnets aanmaken met VPC ID    
+    - name: create VPC subnets
+      ec2_vpc_subnet:
+        vpc_id: "{{vpc_id}}"
+        cidr: "10.0.1.0/24"
+        region: "us-east-1"
+        az: "us-east-1a"
+        tags:
+          Name: "public-a"
+      register: "create_vpc_subnets"
+    
+    ## Subnets aanmaken met VPC ID    
+    - name: create VPC subnets
+      ec2_vpc_subnet:
+        vpc_id: "{{vpc_id}}"
+        cidr: "10.0.4.0/24"
+        region: "us-east-1"
+        az: "us-east-1b"
+        tags:
+          Name: "public-b"
+      register: "create_vpc_subnets"
+    
+    ## subnet ids vinden   
+    - ec2_vpc_subnet_facts:
+        region: "us-east-1"
+        filters:
+          vpc-id: "{{vpc_id}}"
+      register: subnet_facts
+
+    - set_fact:
+        subnet_ids: "{{ subnet_facts.subnets | map(attribute='id')|list }}"
+
+    - name: VPC IGW
+      ec2_vpc_igw:
+        region: "us-east-1"
+        vpc_id: "{{vpc_id}}"
+        state: present
+      register: igw
+    
+    ## security groups aanmaken (2)  
+    - name: Security Groups.
+      ec2_group:
+        name: "{{ item.name }}"
+        vpc_id: "{{ vpc_id }}"
+        description: Example EC2 security group for A4D.
+        region: "{{ item.region | default('us-east-1') }}" # N.Virginia
+        state: present
+        rules: "{{ item.rules }}"
+        rules_egress: "{{ item.rules_egress }}"
+      with_items: "{{ security_groups }}"
+
+    ## Instances aanmaken en deployen op key op frankfurt met security group
+    - name: Provision EC2 instances.
+      ec2:
+        key_name: "{{ item.ssh_key | default('UgurKey') }}"
+        instance_tags:
+          inventory_group: "{{ item.group | default('') }}"
+          inventory_host: "{{ item.name | default('') }}"
+        group: "sg_ec2"
+        vpc_subnet_id: "{{ subnet_ids[0]}}"
+        assign_public_ip: "yes"
+        instance_type: "{{ item.type | default('t2.micro')}}" # Free
+        image: "{{ item.image | default('ami-0f9cf087c1f27d9b1') }}" # Centos
+        region: "{{ item.region | default('us-east-1') }}" # N.Virginia
+        wait: yes
+        wait_timeout: 500
+        exact_count: 1
+        count_tag:
+          inventory_group: "{{ item.group | default('') }}"
+          inventory_host: "{{ item.name | default('') }}"
+      register: created_instances
+      with_items: "{{ instances }}"
+    
+    - name: route table
+      ec2_vpc_route_table:
+        vpc_id: "{{ vpc_id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+    
+    - ec2_instance_facts:
+
+    ## Loadbalancer aanmaken Security group toekenen en subnets
+    - name: Create the ELB
+      ec2_elb_lb:
+        name: "loadbalancerSubnets"
+        state: present
+        subnets: "{{ subnet_ids }}"
+        region: "us-east-1"
+        instance_ids: "i-0040d6f596376c555,i-06da8ff8b9309d4dd"
+        security_group_names: "sg_elb"
+        listeners:
+          - protocol: http
+            load_balancer_port: 80
+            instance_port: 80
+    
+    ## Inventory list vervoledigen
+    - name: Add EC2 instances to inventory groups.
+      add_host:
+        name: "{{ item.1.tagged_instances.0.public_ip }}"
+        groups: "aws,{{ item.1.item.group }},{{ item.1.item.name }}"
+        # You can dynamically add inventory variables per-host.
+        ansible_ssh_user: ubuntu
+        ansible_ssh_private_key_file: ./UgurKey.pem
+        host_key_checking: false
+      when: item.1.instances is defined
+      with_indexed_items: "{{ created_instances.results }}"
+
+# Run some general configuration on all AWS hosts.
+- hosts: aws
+  gather_facts: false
+  become: yes
+
+  tasks:
+    - name: install python
+      raw: sudo apt-get -y install python-simplejson
+    - name: Wait for port 22 to become available.
+      local_action: "wait_for port=22 host={{ inventory_hostname }}"
